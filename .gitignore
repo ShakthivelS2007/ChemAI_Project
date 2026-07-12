@@ -1,0 +1,8 @@
+# Ignore cache and compiled python
+__pycache__/
+
+# Ignore your trained model (don't commit weights to git)
+*.pth
+
+# Ignore raw data folders if you add them later
+processed_data/
