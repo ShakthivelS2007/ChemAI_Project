@@ -23,14 +23,14 @@ class EquivariantMobilityConv(MessagePassing):
         self.radial_mlp = nn.Sequential(nn.Linear(num_rbf, channels), nn.SiLU(), nn.Linear(channels, channels))
         self.vector_mlp = nn.Sequential(nn.Linear(channels, 1, bias=False))
         self.node_mlp = nn.Linear(channels, channels)
+        self.rbf = RadialBasisExpansion(num_rbf=num_rbf, r_max=6.0)
 
     def forward(self, x, v, edge_index, pos):
         row, col = edge_index
         coord_diff = pos[col] - pos[row]
         dists = torch.norm(coord_diff, dim=-1)
         unit_vectors = coord_diff / (dists.unsqueeze(-1) + 1e-6)
-        rbf_engine = RadialBasisExpansion(num_rbf=16, r_max=6.0).to(x.device)
-        edge_weights = self.radial_mlp(rbf_engine(dists))
+        edge_weights = self.radial_mlp(self.rbf(dists))
         vec_j, w_v = v[row], edge_weights.unsqueeze(-1)
         dir_weights = self.vector_mlp(edge_weights).unsqueeze(-1)
         edge_vec_msg = (vec_j * w_v) + (unit_vectors.unsqueeze(1) * dir_weights)
@@ -64,59 +64,58 @@ class EquivariantBatteryTransformer(nn.Module):
         latent = self.fc_fused(global_mean_pool(h_x, batch))
         return {k: head(latent) for k, head in self.heads.items()}
 
+LOG_SPACE_KEYS = ["dielectric", "elastic_moduli"]
+
 # ==============================================================================
 # 2. INFERENCE ENGINE
 # ==============================================================================
 def run_interactive_inference():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = EquivariantBatteryTransformer(node_in=3, hidden=128).to(device)
-    model.load_state_dict(torch.load('models/equivariant_battery_transformer.pth', map_location=device))
+
+    # FIX: checkpoint now contains both the weights AND the exact norm stats
+    # used during training. We must reuse those stats verbatim -- recomputing
+    # them from the whole dataset (as before) silently mismatches the scale
+    # the model was actually trained against.
+    checkpoint = torch.load('models/equivariant_battery_transformer.pth', map_location=device)
+    model.load_state_dict(checkpoint['model_state'])
+    stats = checkpoint['norm_stats']
     model.eval()
-    
-    # Load the full dataset to get global statistics for denormalization
+
     dataset = torch.load('processed_data/equivariant_battery_dataset.pt', weights_only=False)
-    
+
     user_input = input(">> Enter indices to analyze (e.g., 0, 1, 2): ").strip()
     selected_indices = [int(idx.strip()) for idx in user_input.split(",")] if user_input else [0]
     graphs = [dataset[i] for i in selected_indices if 0 <= i < len(dataset)]
     loader = DataLoader(graphs, batch_size=len(graphs), shuffle=False)
-    
-    # Pre-calculate global stats for dielectric and elastic_moduli
-    stats = {}
-    for key in ["dielectric", "elastic_moduli"]:
-        # Extract all targets from the dataset for this property
-        all_y = torch.cat([d.y_dict[key] for d in dataset], dim=0)
-        log_y = torch.log(all_y + 1e-6)
-        stats[key] = {'mu': log_y.mean(), 'sigma': log_y.std()}
 
     with torch.no_grad():
         for b in loader:
             b = b.to(device)
             preds = model(b.x, b.edge_index, b.pos, b.batch)
-            
+
             print("\n" + "="*80)
             print("                     EQUIVARIANT MULTI-HEAD PREDICTION PROFILING")
             print("="*80)
-            
+
             for i in range(b.num_graphs):
                 formula = getattr(b, 'formula', ['Unknown'] * b.num_graphs)[i]
                 print(f"\n[COMPOUND: {formula} | MATRIX INDEX #{selected_indices[i]}]")
-                
+
                 for key, p_raw in preds.items():
-                    if key in ["dielectric", "elastic_moduli"]:
+                    if key in LOG_SPACE_KEYS:
                         mu, sigma = stats[key]['mu'], stats[key]['sigma']
-                        # Denormalize: p_raw is the normalized Z-score
+                        # Denormalize using the SAME mu/sigma the model was trained with
                         p_denorm = (p_raw[i] * sigma) + mu
                         p_val = torch.exp(p_denorm)
                     else:
                         p_val = p_raw[i]
-                    
+
                     t_val = b.y_dict[key][i]
-                    
-                    # Ensure we handle tensors correctly for printing
+
                     p_final = p_val.mean().item()
                     t_final = t_val.mean().item()
-                    
+
                     print(f"{key.replace('_', ' ').title():<25} | Pred: {p_final:<12.4f} | Actual: {t_final:<12.4f}")
 
 if __name__ == "__main__":

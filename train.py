@@ -24,14 +24,16 @@ class EquivariantMobilityConv(MessagePassing):
         self.radial_mlp = nn.Sequential(nn.Linear(num_rbf, channels), nn.SiLU(), nn.Linear(channels, channels))
         self.vector_mlp = nn.Sequential(nn.Linear(channels, 1, bias=False))
         self.node_mlp = nn.Linear(channels, channels)
+        # FIX: instantiate once instead of re-creating (and re-.to(device)-ing)
+        # this on every single forward call. Purely a perf fix, not correctness.
+        self.rbf = RadialBasisExpansion(num_rbf=num_rbf, r_max=6.0)
 
     def forward(self, x, v, edge_index, pos):
         row, col = edge_index
         coord_diff = pos[col] - pos[row]
         dists = torch.norm(coord_diff, dim=-1)
         unit_vectors = coord_diff / (dists.unsqueeze(-1) + 1e-6)
-        rbf_engine = RadialBasisExpansion(num_rbf=16, r_max=6.0).to(x.device)
-        edge_weights = self.radial_mlp(rbf_engine(dists))
+        edge_weights = self.radial_mlp(self.rbf(dists))
         vec_j, w_v = v[row], edge_weights.unsqueeze(-1)
         dir_weights = self.vector_mlp(edge_weights).unsqueeze(-1)
         edge_vec_msg = (vec_j * w_v) + (unit_vectors.unsqueeze(1) * dir_weights)
@@ -71,40 +73,55 @@ class EquivariantBatteryTransformer(nn.Module):
 def log_cosh_loss(pred, target):
     return torch.mean(torch.log(torch.cosh(pred - target + 1e-12)))
 
+LOG_SPACE_KEYS = ["dielectric", "elastic_moduli"]
+
+def compute_global_log_stats(dataset, keys=LOG_SPACE_KEYS):
+    """
+    Computes log-space mean/std ONCE from a fixed dataset (the training split).
+    These stats must be reused, unchanged, at validation time and at inference
+    time -- that consistency is the whole point. Never recompute per-batch.
+    """
+    stats = {}
+    for key in keys:
+        all_y = torch.cat([d.y_dict[key] for d in dataset], dim=0)
+        log_y = torch.log(all_y + 1e-6)
+        stats[key] = {'mu': log_y.mean().item(), 'sigma': (log_y.std() + 1e-6).item()}
+    return stats
+
 class MultiTaskLoss(nn.Module):
-    def __init__(self, num_tasks=7):
+    def __init__(self, norm_stats, num_tasks=7):
         super(MultiTaskLoss, self).__init__()
         # Learned uncertainty weights for multi-task balancing
         self.log_vars = nn.Parameter(torch.ones(num_tasks) * 1.5)
         self.weight_map = {
-            "band_gap": 1.0, 
-            "dielectric": 5.0, 
-            "elastic_moduli": 5.0, 
-            "ionic_conductivity": 1.0, 
-            "activation_energy": 1.0, 
-            "stability_window": 1.0, 
+            "band_gap": 1.0,
+            "dielectric": 5.0,
+            "elastic_moduli": 5.0,
+            "ionic_conductivity": 1.0,
+            "activation_energy": 1.0,
+            "stability_window": 1.0,
             "phase_stability": 1.0
         }
+        # FIX: fixed global normalization constants, computed once from the
+        # training set and passed in -- NOT recomputed from each mini-batch.
+        self.norm_stats = norm_stats
 
     def forward(self, preds, targets):
         total_loss = 0.0
         huber = nn.HuberLoss(delta=1.0)
-        
+
         for idx, (key, pred) in enumerate(preds.items()):
-            if key in ["dielectric", "elastic_moduli"]:
-                # Log-space transformation
+            if key in LOG_SPACE_KEYS:
+                mu = self.norm_stats[key]['mu']
+                sigma = self.norm_stats[key]['sigma']
                 target_log = torch.log(targets[key] + 1e-6)
-                # Standardize log-targets to stabilize gradients
-                target_norm = (target_log - target_log.mean()) / (target_log.std() + 1e-6)
-                # Use Log-Cosh for high-precision properties
+                target_norm = (target_log - mu) / sigma
                 loss = log_cosh_loss(pred, target_norm) * self.weight_map.get(key, 5.0)
             else:
-                # Use Huber loss for standard regression tasks
                 loss = huber(pred, targets[key]) * self.weight_map.get(key, 1.0)
-                
-            # Apply task-specific uncertainty weight
+
             total_loss += torch.exp(-torch.clamp(self.log_vars[idx], -2.0, 5.0)) * loss + self.log_vars[idx]
-            
+
         return total_loss
 
 # ==============================================================================
@@ -116,14 +133,19 @@ def train_pipeline():
     train_data, val_data = train_test_split(full_dataset, test_size=0.15, random_state=42)
     train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=32, shuffle=False)
-    
+
+    # FIX: compute normalization stats ONCE from train_data only (no val/test
+    # leakage), then reuse everywhere -- train, val, and later at inference.
+    norm_stats = compute_global_log_stats(train_data)
+    print("Global log-space norm stats (from train split):", norm_stats)
+
     model = EquivariantBatteryTransformer(node_in=3, hidden=128).to(device)
-    criterion = MultiTaskLoss(num_tasks=7).to(device)
+    criterion = MultiTaskLoss(norm_stats=norm_stats, num_tasks=7).to(device)
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(criterion.parameters()), lr=1e-3)
-    
+
     # Warmup + Cosine Annealing
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=50)
-    
+
     for epoch in range(1, 51):
         model.train()
         train_loss = 0.0
@@ -133,17 +155,17 @@ def train_pipeline():
             preds = model(b.x, b.edge_index, b.pos, b.batch)
             targets = {k: b.y_dict[k].view(b.num_graphs, -1) for k in b.y_dict.keys()}
             loss = criterion(preds, targets)
-            
+
             # Gradient Centralization
             loss.backward()
             for p in model.parameters():
                 if p.grad is not None and p.grad.dim() > 1:
                     p.grad.add_(-p.grad.mean(dim=1, keepdim=True))
-            
+
             optimizer.step()
             scheduler.step()
             train_loss += loss.item()
-            
+
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -152,11 +174,16 @@ def train_pipeline():
                 preds = model(b.x, b.edge_index, b.pos, b.batch)
                 targets = {k: b.y_dict[k].view(b.num_graphs, -1) for k in b.y_dict.keys()}
                 val_loss += criterion(preds, targets).item()
-        
+
         print(f"Epoch {epoch:02d}/50 | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss/len(val_loader):.4f}")
-        
+
     os.makedirs('models', exist_ok=True)
-    torch.save(model.state_dict(), 'models/equivariant_battery_transformer.pth')
+    # FIX: save norm_stats alongside the model weights so predict.py can use
+    # the *exact same* numbers instead of recomputing (and mismatching) them.
+    torch.save({
+        'model_state': model.state_dict(),
+        'norm_stats': norm_stats
+    }, 'models/equivariant_battery_transformer.pth')
 
 if __name__ == "__main__":
     train_pipeline()
