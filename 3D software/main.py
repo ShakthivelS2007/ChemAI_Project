@@ -9,45 +9,52 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
 import pyqtgraph.opengl as gl
 from pymatgen.core import Structure
 
-# Try importing PyG layers safely
-try:
-    from torch_geometric.nn import GATv2Conv, global_mean_pool
-except ImportError:
-    GATv2Conv = None
-    global_mean_pool = None
+# train.py lives one directory up (ChemAI_Project/), outside this "3D
+# software" folder, so it's not importable by default. Add that parent
+# directory to sys.path before importing -- this is resolved relative to
+# this file's own location, so it works no matter what directory you
+# launch main.py from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Model architecture must be imported from train.py so the class definition
+# can never drift out of sync with the one the checkpoint was actually
+# trained with.
+from train import EquivariantBatteryTransformer
 
 # -------------------------------------------------------------------
-# 1. HARDCODED MODEL COMPATIBLE FEATURE MAP
+# 1. FEATURE MAP -- must exactly match dataset_builder.py's table,
+# since that is what the model was trained on.
 # -------------------------------------------------------------------
 FEATURE_MAP = {
-    'O': [8, 3.44, 60],    'Li': [3, 0.98, 145],  'Si': [14, 1.90, 110],
+    'O':  [8,  3.44, 60],  'Li': [3,  0.98, 145], 'Si': [14, 1.90, 110],
     'Al': [13, 1.61, 125], 'Fe': [26, 1.83, 140], 'P':  [15, 2.19, 100],
-    'Zr': [40, 1.33, 160], 'Rb': [37, 0.82, 248], 'Ba': [56, 0.89, 215],
-    'Ti': [22, 1.54, 140], 'K':  [19, 0.82, 227], 'Na': [11, 0.93, 186],
-    'H':  [1, 2.20, 37],   'Br': [35, 2.96, 114], 'Co': [27, 1.88, 125],
-    'Ge': [32, 2.01, 122], 'Cl': [17, 3.16, 99],  'F':  [9, 3.98, 50],
-    'Au': [79, 2.54, 144], 'Mg': [12, 1.31, 160], 'Ca': [20, 1.00, 197],
-    'Sr': [38, 0.95, 215], 'Hf': [72, 1.30, 155], 'Cu': [29, 1.90, 128],
-    'Ag': [47, 1.93, 144], 'Ga': [31, 1.81, 135], 'As': [33, 2.18, 115],
-    'C': [6, 2.55, 70],    'N': [7, 3.04, 65],    'S': [16, 2.58, 100],
-    'Se': [34, 2.55, 115], 'Te': [52, 2.1, 140],  'I': [53, 2.66, 140],
-    'B': [5, 2.04, 85],    'Be': [4, 1.57, 105],  'Sc': [21, 1.36, 160], 
-    'V': [23, 1.63, 135],  'Cr': [24, 1.66, 140], 'Mn': [25, 1.55, 140], 
-    'Ni': [28, 1.91, 135], 'Zn': [30, 1.65, 135], 'Y': [39, 1.22, 180],
-    'Nb': [41, 1.6, 145],  'Mo': [42, 2.16, 145], 'Ru': [44, 2.2, 130],
-    'Rh': [45, 2.28, 135], 'Pd': [46, 2.2, 140],  'Cd': [48, 1.69, 155], 
-    'Sn': [50, 1.96, 145], 'Sb': [51, 2.05, 145], 'Cs': [55, 0.79, 260], 
-    'La': [57, 1.1, 195],  'Ta': [73, 1.5, 145],  'W': [74, 2.36, 135],
-    'Re': [75, 1.9, 135],  'Os': [76, 2.2, 130],  'Ir': [77, 2.2, 135],
-    'Pt': [78, 2.28, 135], 'Hg': [80, 2.0, 150],  'Tl': [81, 1.62, 170], 
-    'Pb': [82, 2.33, 180], 'Bi': [83, 2.02, 160], 'Ce': [58, 1.12, 185], 
-    'Pr': [59, 1.13, 185], 'Nd': [60, 1.14, 185], 'Sm': [62, 1.17, 185], 
-    'Gd': [64, 1.2, 180],  'Tb': [65, 1.1, 175],  'Dy': [66, 1.22, 175], 
-    'Ho': [67, 1.23, 175], 'Er': [68, 1.24, 175], 'Tm': [69, 1.25, 175], 
-    'Yb': [70, 1.1, 170],  'Lu': [71, 1.27, 175], 'Th': [90, 1.3, 180],
-    'Pa': [91, 1.5, 180],  'U': [92, 1.38, 175],  'Ac': [89, 1.1, 195],
+    'Zr': [40, 1.33, 175], 'Rb': [37, 0.82, 235], 'Ba': [56, 0.89, 215],
+    'Ti': [22, 1.54, 160], 'K':  [19, 0.82, 220], 'Na': [11, 0.93, 180],
+    'H':  [1,  2.20, 25],  'Br': [35, 2.96, 115], 'Co': [27, 1.88, 135],
+    'Ge': [32, 2.01, 120], 'Cl': [17, 3.16, 100], 'F':  [9,  3.98, 50],
+    'Au': [79, 2.54, 135], 'Mg': [12, 1.31, 145], 'Ca': [20, 1.00, 195],
+    'Sr': [38, 0.95, 215], 'Hf': [72, 1.30, 175], 'Cu': [29, 1.90, 135],
+    'Ag': [47, 1.93, 145], 'Ga': [31, 1.81, 130], 'As': [33, 2.18, 115],
+    'C':  [6,  2.55, 70],  'N':  [7,  3.04, 65],  'S':  [16, 2.58, 100],
+    'Se': [34, 2.55, 115], 'Te': [52, 2.10, 135], 'I':  [53, 2.66, 140],
+    'B':  [5,  2.04, 85],  'Be': [4,  1.57, 105], 'Sc': [21, 1.36, 160],
+    'V':  [23, 1.63, 135], 'Cr': [24, 1.66, 140], 'Mn': [25, 1.55, 140],
+    'Ni': [28, 1.91, 135], 'Zn': [30, 1.65, 135], 'Y':  [39, 1.22, 180],
+    'Nb': [41, 1.60, 145], 'Mo': [42, 2.16, 145], 'Ru': [44, 2.20, 130],
+    'Rh': [45, 2.28, 135], 'Pd': [46, 2.20, 140], 'Cd': [48, 1.69, 140],
+    'Sn': [50, 1.96, 140], 'Sb': [51, 2.05, 140], 'Cs': [55, 0.79, 260],
+    'La': [57, 1.10, 195], 'Ta': [73, 1.50, 145], 'W':  [74, 2.36, 145],
+    'Re': [75, 1.90, 135], 'Os': [76, 2.20, 130], 'Ir': [77, 2.20, 135],
+    'Pt': [78, 2.28, 135], 'Hg': [80, 2.00, 135], 'Tl': [81, 1.62, 145],
+    'Pb': [82, 2.33, 180], 'Bi': [83, 2.02, 160], 'Ce': [58, 1.12, 185],
+    'Pr': [59, 1.13, 185], 'Nd': [60, 1.14, 185], 'Sm': [62, 1.17, 185],
+    'Gd': [64, 1.20, 180], 'Tb': [65, 1.20, 175], 'Dy': [66, 1.22, 175],
+    'Ho': [67, 1.23, 175], 'Er': [68, 1.24, 175], 'Tm': [69, 1.25, 175],
+    'Yb': [70, 1.10, 175], 'Lu': [71, 1.27, 175], 'Th': [90, 1.30, 180],
+    'Pa': [91, 1.50, 180], 'U':  [92, 1.38, 175], 'Ac': [89, 1.10, 195],
     'In': [49, 1.78, 155]
 }
+
 class CADViewWidget(gl.GLViewWidget):
     """Custom 3D viewport that enables free panning and a locked corner orientation axis."""
     def __init__(self, parent=None):
@@ -56,10 +63,7 @@ class CADViewWidget(gl.GLViewWidget):
         self.opts['center'] = QVector3D(0.0, 0.0, 0.0)
         
     def paintGL(self, *args, **kwds):
-        # 1. First, render the normal 3D crystal scene completely
         super().paintGL(*args, **kwds)
-        
-        # 2. Setup isolated viewport for the screen-space corner widget
         import OpenGL.GL as ogl
         
         ogl.glMatrixMode(ogl.GL_PROJECTION)
@@ -68,49 +72,39 @@ class CADViewWidget(gl.GLViewWidget):
         
         width = self.width()
         height = self.height()
-        ogl.glViewport(10, 10, 80, 80) # Fixed 80x80 pixel square box in the corner
+        ogl.glViewport(10, 10, 80, 80)
         
-        scale = 0.0414  # Matches a 45-degree field of view clip space
+        scale = 0.0414
         ogl.glFrustum(-scale, scale, -scale, scale, 0.1, 10.0)
         
         ogl.glMatrixMode(ogl.GL_MODELVIEW)
         ogl.glPushMatrix()
         ogl.glLoadIdentity()
         
-        # Move the mini-axis back slightly so it's safely inside the lens view
         ogl.glTranslatef(0.0, 0.0, -2.5)
         
-        # 3. PURE GEOMETRIC ROTATION ENGINE
-        # Extract the camera angles directly from PyQtGraph mouse option dictionary state
         elev = self.opts['elevation']
         azim = self.opts['azimuth']
         
-        # Apply rotations in the exact same sequence PyQtGraph maps your viewport scene
-        ogl.glRotatef(elev - 90, 1.0, 0.0, 0.0)  # Tilt up/down
-        ogl.glRotatef(-azim - 90, 0.0, 0.0, 1.0) # Spin left/right
+        ogl.glRotatef(elev - 90, 1.0, 0.0, 0.0)
+        ogl.glRotatef(-azim - 90, 0.0, 0.0, 1.0)
         
-        # Clear depth bits so the corner indicator draws sharply on top of the grid lines
         ogl.glClear(ogl.GL_DEPTH_BUFFER_BIT)
         
-        # 4. Draw the 3 bold colored lines (X=Red, Y=Green, Z=Blue)
         ogl.glLineWidth(3)
         ogl.glBegin(ogl.GL_LINES)
         
-        # X Axis - Red
         ogl.glColor4f(1.0, 0.2, 0.2, 1.0)
         ogl.glVertex3f(0.0, 0.0, 0.0); ogl.glVertex3f(0.8, 0.0, 0.0)
         
-        # Y Axis - Green
         ogl.glColor4f(0.2, 1.0, 0.2, 1.0)
         ogl.glVertex3f(0.0, 0.0, 0.0); ogl.glVertex3f(0.0, 0.8, 0.0)
         
-        # Z Axis - Blue
         ogl.glColor4f(0.2, 0.2, 1.0, 1.0)
         ogl.glVertex3f(0.0, 0.0, 0.0); ogl.glVertex3f(0.0, 0.0, 0.8)
         
         ogl.glEnd()
         
-        # 5. Reset normal matrix pipelines back to prevent breaking UI rendering layers
         ogl.glPopMatrix()
         ogl.glMatrixMode(ogl.GL_PROJECTION)
         ogl.glPopMatrix()
@@ -118,77 +112,28 @@ class CADViewWidget(gl.GLViewWidget):
         ogl.glViewport(0, 0, width, height)
 
 # -------------------------------------------------------------------
-# 2. EXACT MATCH MODEL BLUEPRINT ARCHITECTURE
-# -------------------------------------------------------------------
-class ChemGAT(torch.nn.Module):
-    def __init__(self):
-        super(ChemGAT, self).__init__()
-        self.conv1 = GATv2Conv(3, 32, heads=4, edge_dim=1) 
-        self.conv2 = GATv2Conv(32 * 4, 64, heads=2, edge_dim=1)
-        self.conv3 = GATv2Conv(64 * 2, 64, edge_dim=1)
-        self.fc1 = torch.nn.Linear(64, 32)
-        self.fc2 = torch.nn.Linear(32, 2) # Multitask output [Batch, 2]
-
-    def forward(self, *args, **kwargs):
-        """
-        Dynamic forward pass that automatically routes both PyG Data objects 
-        (from training) and individual array tensors (from desktop inference).
-        """
-        if len(args) >= 2 or 'edge_index' in kwargs:
-            x = args[0] if len(args) > 0 else kwargs.get('x')
-            edge_index = args[1] if len(args) > 1 else kwargs.get('edge_index')
-            edge_attr = args[2] if len(args) > 2 else kwargs.get('edge_attr', None)
-            batch = args[3] if len(args) > 3 else kwargs.get('batch', None)
-            
-            if batch is None:
-                batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        else:
-            data = args[0] if len(args) > 0 else kwargs.get('data')
-            x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-
-        x = F.elu(self.conv1(x, edge_index, edge_attr))
-        if self.training:
-            x = F.dropout(x, p=0.1, training=True)
-        x = F.elu(self.conv2(x, edge_index, edge_attr))
-        x = F.elu(self.conv3(x, edge_index, edge_attr))
-        x = global_mean_pool(x, batch)
-        x = F.relu(self.fc1(x))
-        
-        out = self.fc2(x)
-        
-        # Slice multitask dimensions cleanly to separate outputs
-        bg = out[:, 0:1]
-        diel = out[:, 1:2]
-        return bg, diel
-
-# -------------------------------------------------------------------
 # 3. CORE DESKTOP UI ENGINE
 # -------------------------------------------------------------------
 class ChemAIDesktopApp(QMainWindow):
     def update_preview_atom(self):
-        """Draws a translucent yellow ghost sphere at the coordinates currently typed in."""
-        # 1. Clean up the previous ghost frame if it exists
         if self.preview_mesh_item in self.canvas.items:
             self.canvas.removeItem(self.preview_mesh_item)
             
         try:
-            # 2. Extract input values safely
             x = float(self.x_input.text())
             y = float(self.y_input.text())
             z = float(self.z_input.text())
             
-            # 3. Build a distinct translucent yellow preview marker
             preview_mesh = gl.MeshData.sphere(rows=10, cols=20, radius=0.22)
             self.preview_mesh_item = gl.GLMeshItem(
                 meshdata=preview_mesh, 
                 smooth=True, 
-                color=(1.0, 0.85, 0.0, 0.45), # Soft translucent gold
+                color=(1.0, 0.85, 0.0, 0.45),
                 shader='shaded'
             )
             self.preview_mesh_item.translate(x, y, z)
             self.canvas.addItem(self.preview_mesh_item)
         except ValueError:
-            # Pass silently so typing decimals like "0." won't trip console faults
             pass
 
     def __init__(self):
@@ -198,6 +143,7 @@ class ChemAIDesktopApp(QMainWindow):
         
         self.device = torch.device("cpu")
         self.model = None
+        self.norm_stats = None
         self.load_ml_model()
         
         self.current_formula = "None Loaded"
@@ -207,31 +153,38 @@ class ChemAIDesktopApp(QMainWindow):
         self.init_ui()
 
     def load_ml_model(self):
-        MODEL_PATH = "chemai_model_v4_multitask.pth"
+        # models/ lives under ChemAI_Project/ (the parent of this "3D
+        # software" folder), same as train.py -- anchor to that, not to
+        # whatever directory the script happens to be launched from.
+        PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "equivariant_battery_transformer.pth")
         try:
-            self.model = ChemGAT()
+            self.model = EquivariantBatteryTransformer(node_in=3, hidden=128)
             if os.path.exists(MODEL_PATH):
-                self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+                checkpoint = torch.load(MODEL_PATH, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state'])
+                self.norm_stats = checkpoint['norm_stats']
                 self.model.eval()
                 print("Model loaded successfully into standalone memory.")
+                print("Loaded norm_stats:", self.norm_stats)
             else:
                 print(f"Weights file not found at local target path: {MODEL_PATH}")
+                self.model = None
         except Exception as e:
             print(f"Model weight warning: Offline extraction mode active. ({e})")
+            self.model = None
 
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QHBoxLayout(main_widget)
         
-        # --- LEFT VIEWPORT ---
         self.canvas = CADViewWidget()
         self.canvas.setCameraPosition(distance=12)
         grid = gl.GLGridItem()
         self.canvas.addItem(grid)
         layout.addWidget(self.canvas, stretch=3)
         
-        # --- RIGHT VIEWPORT ---
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         layout.addWidget(right_panel, stretch=1)
@@ -257,7 +210,6 @@ class ChemAIDesktopApp(QMainWindow):
         self.y_input = QLineEdit("0.0")
         self.z_input = QLineEdit("0.0")
         
-        # --- LIVE PREVIEW SIGNALS WIRE UP ---
         self.x_input.textChanged.connect(self.update_preview_atom)
         self.y_input.textChanged.connect(self.update_preview_atom)
         self.z_input.textChanged.connect(self.update_preview_atom)
@@ -279,7 +231,7 @@ class ChemAIDesktopApp(QMainWindow):
         modify_btn.clicked.connect(self.tweak_crystal_structure)
         right_layout.addWidget(modify_btn)
         
-        predict_btn = QPushButton("Run GATv2 Inference")
+        predict_btn = QPushButton("Run Equivariant Inference")
         predict_btn.setStyleSheet("background-color: #2b5c8f; color: white; font-weight: bold; padding: 8px;")
         predict_btn.clicked.connect(self.run_live_inference)
         right_layout.addWidget(predict_btn)
@@ -289,11 +241,19 @@ class ChemAIDesktopApp(QMainWindow):
         self.result_formula = QLabel("Formula: None Loaded")
         self.result_bg = QLabel("Predicted Band Gap: --")
         self.result_diel = QLabel("Predicted Dielectric: --")
+        self.result_ionic = QLabel("Predicted Ionic Conductivity: --")
+        self.result_phase = QLabel("Predicted Phase Stability (E above hull): --")
+        self.result_window = QLabel("Predicted Stability Window: --")
+        self.result_elastic = QLabel("Predicted Elastic Moduli (K, G): --")
         self.result_status = QLabel("Screening Status: Waiting")
         
         output_layout.addWidget(self.result_formula)
         output_layout.addWidget(self.result_bg)
         output_layout.addWidget(self.result_diel)
+        output_layout.addWidget(self.result_ionic)
+        output_layout.addWidget(self.result_phase)
+        output_layout.addWidget(self.result_window)
+        output_layout.addWidget(self.result_elastic)
         output_layout.addWidget(self.result_status)
         right_layout.addWidget(output_box)
         
@@ -334,7 +294,6 @@ class ChemAIDesktopApp(QMainWindow):
             self.x_input.setText("0.0")
             self.y_input.setText("0.0")
             self.z_input.setText("0.0")
-            # Remove the ghost preview cleanly right after injecting the real atom
             if self.preview_mesh_item in self.canvas.items:
                 self.canvas.removeItem(self.preview_mesh_item)
                 
@@ -348,10 +307,8 @@ class ChemAIDesktopApp(QMainWindow):
             self.atom_list.addItem(f"[{idx}] {element} | Coordinates: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
 
     def update_3d_canvas(self):
-        # 1. Clear out all old elements except the base grid floor
         for item in list(self.canvas.items):
             if isinstance(item, (gl.GLMeshItem, gl.GLLinePlotItem)):
-                # Keep the live preview ghost from being accidentally deleted while typing
                 if item == self.preview_mesh_item:
                     continue
                 self.canvas.removeItem(item)
@@ -359,7 +316,6 @@ class ChemAIDesktopApp(QMainWindow):
         if len(self.atom_positions) == 0:
             return
 
-        # 2. Render each atom with balanced square-root scaling
         for idx, pos in enumerate(self.atom_positions):
             element = self.atom_elements[idx]
             traits = FEATURE_MAP.get(element, [1, 2.2, 25])
@@ -377,7 +333,6 @@ class ChemAIDesktopApp(QMainWindow):
             mesh_item.translate(*pos)
             self.canvas.addItem(mesh_item)
 
-        # 3. TRUE DEPTH PERCEPTION: Dynamic Bounding Box Outline
         min_coords = np.min(self.atom_positions, axis=0) - 0.4
         max_coords = np.max(self.atom_positions, axis=0) + 0.4
         
@@ -393,7 +348,6 @@ class ChemAIDesktopApp(QMainWindow):
             box_line = gl.GLLinePlotItem(pos=pts, color=(0.5, 0.5, 0.5, 0.4), width=1)
             self.canvas.addItem(box_line)
 
-        # 4. Dynamic Bond Engine
         bond_threshold = 3.0
         num_atoms = len(self.atom_positions)
         for i in range(num_atoms):
@@ -417,60 +371,105 @@ class ChemAIDesktopApp(QMainWindow):
         if len(self.atom_positions) == 0:
             self.result_status.setText("Screening Status: No structure loaded")
             return
-            
+        if self.model is None:
+            self.result_status.setText("Screening Status: Model not loaded")
+            return
+
         num_atoms = len(self.atom_elements)
-        
-        # 1. Fetch element properties and divide by train.py's exact NORM_TENS vector
+
+        # 1. Node features: RAW values, no normalization -- matches
+        #    dataset_builder.py exactly (the model was trained on raw
+        #    [atomic_number, electronegativity, covalent_radius]).
         node_features = []
         for element in self.atom_elements:
             traits = FEATURE_MAP.get(element, [1, 2.2, 25])
             node_features.append([float(traits[0]), float(traits[1]), float(traits[2])])
-            
-        norm_tens = torch.tensor([100.0, 4.0, 250.0], dtype=torch.float)
-        x = torch.tensor(node_features, dtype=torch.float) / norm_tens
-        
-        # 2. Build graph matrices and structure geometry vectors
+        x = torch.tensor(node_features, dtype=torch.float)
+
+        # 2. Positions tensor -- required directly by the equivariant model
+        #    (distances/directions are computed internally from `pos`).
+        pos = torch.tensor(self.atom_positions, dtype=torch.float)
+
+        # 3. Edges: cutoff of 4.5 A, matching dataset_builder.py's EDGE_CUTOFF
+        #    (NOT the old 3.0 A bond_threshold used for the visual bonds).
+        EDGE_CUTOFF = 4.5
         edge_list = []
-        edge_features = []
-        bond_threshold = 3.0
         for i in range(num_atoms):
             for j in range(num_atoms):
-                if i == j: 
+                if i == j:
                     continue
-                
                 dist = np.linalg.norm(self.atom_positions[i] - self.atom_positions[j])
-                if dist <= bond_threshold:
+                if dist <= EDGE_CUTOFF:
                     edge_list.append([i, j])
-                    edge_features.append([float(dist)])
-                    
+
         if len(edge_list) > 0:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-            edge_attr = torch.tensor(edge_features, dtype=torch.float).view(-1, 1)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_attr = torch.empty((0, 1), dtype=torch.float)
-            
-        # 3. Predict properties and scale back outputs using TARGET_NORM factors
-        if self.model is not None:
-            try:
-                with torch.no_grad():
-                    output_bg, output_diel = self.model(x, edge_index, edge_attr)
-                    
-                    # Target scaling restoration parameters: TARGET_NORM = [1.0, 10.0]
-                    predicted_bg = float(output_bg.item()) * 1.0
-                    predicted_diel = float(output_diel.item()) * 10.0
-            except Exception as e:
-                print(f"Model Forward Pass Error: {str(e)}")
-                self.result_status.setText(f"Error: {str(e)}")
-                return
-        else:
-            predicted_bg = 3.4201
-            predicted_diel = 11.5842
-            
+
+        batch = torch.zeros(num_atoms, dtype=torch.long)
+
+        try:
+            with torch.no_grad():
+                preds = self.model(x, edge_index, pos, batch)
+
+                # -- band_gap: raw value, no normalization applied at train time --
+                predicted_bg = float(preds["band_gap"].item())
+
+                # -- log-space heads: value = exp(pred * sigma + mu) - 1e-6 --
+                def decode_log(key, idx=None):
+                    stats = self.norm_stats.get(key)
+                    if stats is None:
+                        return None
+                    mu, sigma = stats['mu'], stats['sigma']
+                    raw = preds[key]
+                    val = raw if idx is None else raw[:, idx:idx+1]
+                    return float(torch.exp(val * sigma + mu).item() - 1e-6)
+
+                predicted_diel = decode_log("dielectric")
+                predicted_ionic = decode_log("ionic_conductivity")
+                predicted_k = decode_log("elastic_moduli", idx=0)
+                predicted_g = decode_log("elastic_moduli", idx=1)
+
+                # -- phase_stability: raw (energy above hull, eV), no normalization --
+                predicted_phase = float(preds["phase_stability"].item())
+
+                # -- stability_window: gated. Only trust it if the auxiliary
+                #    classifier says a real (nonzero) window exists. --
+                gate_prob = torch.sigmoid(preds["stability_gate"]).item()
+                has_window = gate_prob > 0.5
+                if has_window:
+                    window = preds["stability_window"][0]
+                    v_low, v_high = float(window[0].item()), float(window[1].item())
+                else:
+                    v_low, v_high = None, None
+
+        except Exception as e:
+            print(f"Model Forward Pass Error: {str(e)}")
+            self.result_status.setText(f"Error: {str(e)}")
+            return
+
         self.result_bg.setText(f"Predicted Band Gap: {predicted_bg:.4f} eV")
-        self.result_diel.setText(f"Predicted Dielectric: {predicted_diel:.4f}")
-        
-        is_candidate = bool(predicted_bg > 3.0 and predicted_diel > 10.0)
+        self.result_diel.setText(
+            f"Predicted Dielectric: {predicted_diel:.4f}" if predicted_diel is not None else "Predicted Dielectric: N/A"
+        )
+        self.result_ionic.setText(
+            f"Predicted Ionic Conductivity: {predicted_ionic:.6e} S/cm" if predicted_ionic is not None else "Predicted Ionic Conductivity: N/A"
+        )
+        self.result_phase.setText(f"Predicted Phase Stability (E above hull): {predicted_phase:.4f} eV")
+        if has_window:
+            self.result_window.setText(f"Predicted Stability Window: {v_low:.3f} V - {v_high:.3f} V (gate: {gate_prob:.2f})")
+        else:
+            self.result_window.setText(f"Predicted Stability Window: None predicted (gate: {gate_prob:.2f})")
+        if predicted_k is not None and predicted_g is not None:
+            self.result_elastic.setText(f"Predicted Elastic Moduli: K={predicted_k:.2f} GPa, G={predicted_g:.2f} GPa")
+        else:
+            self.result_elastic.setText("Predicted Elastic Moduli: N/A")
+
+        is_candidate = bool(
+            predicted_bg > 3.0
+            and predicted_diel is not None and predicted_diel > 10.0
+        )
         self.result_status.setText(f"Screening Status: {'PASSED CANDIDATE' if is_candidate else 'REJECTED'}")
 
 
