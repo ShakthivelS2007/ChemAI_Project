@@ -8,11 +8,16 @@ from torch_geometric.data import Data
 # ==============================================================================
 # PIPELINE CONFIGURATION
 # ==============================================================================
-API_KEY = "DhQOKAWNR9JgVQqsaBS76A0jIRg3Vwgh"
-OUTPUT_PATH = 'processed_data/equivariant_battery_dataset.pt'
-MAX_MATERIALS = 5000  # Target data window for training initialization
+# FIX: never hardcode API keys in source. Set this in your shell:
+#   export MP_API_KEY="your-key-here"
+API_KEY = os.environ.get("MP_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Set the MP_API_KEY environment variable before running this script.")
 
-# Atomic property matrix: [Atomic Number, Electronegativity, Covalent Radius (pm)]
+OUTPUT_PATH = 'processed_data/equivariant_battery_dataset.pt'
+MAX_MATERIALS = 5000
+EDGE_CUTOFF = 4.5  # Angstrom
+
 FEATURE_MAP = {
     'O':  [8,  3.44, 60],  'Li': [3,  0.98, 145], 'Si': [14, 1.90, 110],
     'Al': [13, 1.61, 125], 'Fe': [26, 1.83, 140], 'P':  [15, 2.19, 100],
@@ -43,110 +48,200 @@ FEATURE_MAP = {
     'In': [49, 1.78, 155]
 }
 
-def estimate_transport_physics(structure, elements):
-    """
-    Computes deterministic kinetic estimates based on structural free volume
-    and packing descriptors to anchor Ionic Conductivity and Activation Energy.
-    """
-    has_mobile_ion = any(ion in elements for ion in ['Li', 'Na', 'Mg', 'Ca'])
-    vol_per_atom = float(structure.volume) / len(structure)
-    
-    if has_mobile_ion:
-        base_ea = 0.65 - (vol_per_atom * 0.008)
-        act_energy = max(0.15, min(base_ea + np.random.normal(0, 0.04), 0.9))
-        base_cond = -1.5 - (act_energy * 8.0)
-        ionic_cond = max(-9.0, min(base_cond + np.random.normal(0, 0.3), -1.5))
-        v_low = max(0.0, min(1.5 + np.random.normal(0, 0.2), 2.0))
-        v_high = min(6.0, max(3.8 + np.random.normal(0, 0.3), 2.2))
-    else:
-        act_energy = max(0.85, 1.5 + np.random.normal(0, 0.15))
-        ionic_cond = min(-10.0, -12.0 + np.random.normal(0, 0.5))
-        v_low, v_high = 0.0, 0.0
-        
-    return act_energy, ionic_cond, v_low, v_high
+# All tasks the merged dataset can carry a value for. Every graph gets a
+# y_dict entry AND a mask_dict entry for each of these -- mask says whether
+# that particular value is trustworthy for that particular graph. Consumers
+# (the loss function) must never use a value where mask is False.
+ALL_TASKS = ["band_gap", "dielectric", "ionic_conductivity",
+             "stability_window", "phase_stability", "elastic_moduli"]
+# NOTE: activation_energy has been removed entirely -- the old
+# estimate_transport_physics() function fabricated it (and ionic_conductivity)
+# from a hand-written formula with injected noise, not real data. No
+# comparable real dataset at this scale was found this pass. Revisit with
+# He et al. 2020's BVSE-derived activation energies if/when you want it back.
 
+def build_graph_from_structure(structure, elements):
+    """Shared graph-construction logic for both MP and OBELiX structures."""
+    if any(el not in FEATURE_MAP for el in elements):
+        return None
+    node_features = [FEATURE_MAP[el] for el in elements]
+    x = torch.tensor(node_features, dtype=torch.float)
+    pos = torch.tensor(structure.cart_coords, dtype=torch.float)
 
-def build_equivariant_dataset():
-    if not os.path.exists('processed_data'):
-        os.makedirs('processed_data')
-        
+    edge_index = []
+    for i, site_i in enumerate(structure):
+        for j, site_j in enumerate(structure):
+            if i != j:
+                dist = site_i.distance(site_j)
+                if dist <= EDGE_CUTOFF:
+                    edge_index.append([i, j])
+    if not edge_index:
+        return None
+    edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    return x, pos, edge_index_tensor
+
+def make_empty_targets():
+    """Placeholder y_dict/mask_dict with everything marked invalid. Callers
+    fill in the tasks they actually have real data for and flip those masks
+    to True."""
+    y = {
+        "band_gap": torch.tensor([0.0]), "dielectric": torch.tensor([0.0]),
+        "ionic_conductivity": torch.tensor([0.0]),
+        "stability_window": torch.tensor([0.0, 0.0]),
+        "phase_stability": torch.tensor([0.0]),
+        "elastic_moduli": torch.tensor([0.0, 0.0]),
+    }
+    mask = {k: torch.tensor([False]) for k in ALL_TASKS}
+    return y, mask
+
+# ==============================================================================
+# SOURCE 1: Materials Project (band_gap, dielectric, elastic_moduli,
+# phase_stability, stability_window)
+# ==============================================================================
+def build_mp_dataset():
     pyg_dataset = []
-    
     with MPRester(API_KEY) as mpr:
-        print("\n=== STEP 1: Querying Materials Project Database Summary ===")
+        print("\n=== MP STEP 1: Querying Materials Project Database Summary ===")
+        # FIX: is_stable=True guarantees energy_above_hull ~= 0 for every
+        # result, which is exactly why phase_stability had zero variance.
+        # Use a range instead so metastable phases (still physically
+        # reasonable, just not on the exact convex hull) are included too.
         docs = mpr.materials.summary.search(
             has_props=["dielectric", "elasticity"],
-            is_stable=True,
+            energy_above_hull=(0, 0.5),
             fields=["material_id", "structure", "band_gap", "energy_above_hull", "formula_pretty"]
         )[:MAX_MATERIALS]
-        
+
         mat_ids = [doc.material_id for doc in docs]
-        
-        print("\n=== STEP 2: Pulling Secondary Property Sub-Endpoints ===")
-        print("-> Fetching core dielectric profiles...")
+
+        print("=== MP STEP 2: Pulling Secondary Property Sub-Endpoints ===")
         diel_docs = mpr.materials.dielectric.search(material_ids=mat_ids, fields=["material_id", "e_total"])
         diel_map = {str(d.material_id): float(d.e_total) for d in diel_docs if hasattr(d, 'e_total')}
-        
-        print("-> Fetching core mechanical elasticity profiles...")
+
         elastic_docs = mpr.materials.elasticity.search(material_ids=mat_ids, fields=["material_id", "bulk_modulus", "shear_modulus"])
-        
         elastic_map = {}
         for e in elastic_docs:
-            # FIXED: Using getattr() on Pydantic sub-objects to fetch attributes cleanly
             if hasattr(e, 'bulk_modulus') and e.bulk_modulus and hasattr(e, 'shear_modulus') and e.shear_modulus:
                 k_voigt = float(getattr(e.bulk_modulus, "voigt", 0.0))
                 g_voigt = float(getattr(e.shear_modulus, "voigt", 0.0))
                 elastic_map[str(e.material_id)] = (k_voigt, g_voigt)
-        
-        print("\n=== STEP 3: Mapping Features into Geometric Data Formats ===")
+
+        print("-> Fetching real electrochemical stability records...")
+        # FIX #3: there's no flat min_voltage/max_voltage field on this doc at
+        # all -- confirmed from the error message listing every available
+        # field. The real per-step voltage data lives inside `electrode_object`
+        # (a pymatgen InsertionElectrode), specifically `.voltage_pairs`, each
+        # of which has a `.voltage` attribute. min/max across those steps is
+        # our real electrochemical stability window.
+        from pymatgen.core import Element
+        electro_map = {}
+        mat_id_set = set(mat_ids)
+        try:
+            electrode_docs = mpr.materials.insertion_electrodes.search(
+                working_ion=Element("Li"),
+                fields=["material_ids", "electrode_object"]
+            )
+            for e in electrode_docs:
+                eo = getattr(e, "electrode_object", None)
+                if eo is None or not getattr(eo, "voltage_pairs", None):
+                    continue
+                voltages = [vp.voltage for vp in eo.voltage_pairs]
+                v_low, v_high = min(voltages), max(voltages)
+                for m_id in getattr(e, "material_ids", []) or []:
+                    if str(m_id) in mat_id_set:
+                        electro_map[str(m_id)] = (v_low, v_high)
+        except Exception as ex:
+            print(f"insertion_electrodes query failed ({ex}). stability_window will be masked out entirely.")
+        print(f"-> Got real electrochemistry data for {len(electro_map)} materials.")
+
+        print("=== MP STEP 3: Mapping Features into Geometric Data Formats ===")
         for doc in tqdm(docs):
             m_id = str(doc.material_id)
             if m_id not in diel_map or m_id not in elastic_map:
                 continue
-                
+
             struct = doc.structure
             elements = [str(spec.symbol) for spec in struct.species]
-            
-            if any(el not in FEATURE_MAP for el in elements):
+            graph = build_graph_from_structure(struct, elements)
+            if graph is None:
                 continue
-                
-            node_features = [FEATURE_MAP[el] for el in elements]
-            x = torch.tensor(node_features, dtype=torch.float)
-            pos = torch.tensor(struct.cart_coords, dtype=torch.float)
-            
-            edge_index = []
-            for i, site_i in enumerate(struct):
-                for j, site_j in enumerate(struct):
-                    if i != j:
-                        dist = site_i.distance(site_j)
-                        if dist <= 4.5: 
-                            edge_index.append([i, j])
-                            
-            if not edge_index:
-                continue
-            edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-            
-            act_energy, ionic_cond, v_low, v_high = estimate_transport_physics(struct, elements)
+            x, pos, edge_index_tensor = graph
+
+            y, mask = make_empty_targets()
+            y["band_gap"] = torch.tensor([float(doc.band_gap)]); mask["band_gap"][0] = True
+            y["dielectric"] = torch.tensor([diel_map[m_id]]); mask["dielectric"][0] = True
             k_mod, g_mod = elastic_map[m_id]
-            
-            targets = {
-                "band_gap": torch.tensor([float(doc.band_gap)], dtype=torch.float),
-                "dielectric": torch.tensor([diel_map[m_id]], dtype=torch.float),
-                "ionic_conductivity": torch.tensor([ionic_cond], dtype=torch.float),
-                "activation_energy": torch.tensor([act_energy], dtype=torch.float),
-                "stability_window": torch.tensor([v_low, v_high], dtype=torch.float),
-                "phase_stability": torch.tensor([float(doc.energy_above_hull)], dtype=torch.float),
-                "elastic_moduli": torch.tensor([k_mod, g_mod], dtype=torch.float)
-            }
-            
-            data_obj = Data(x=x, edge_index=edge_index_tensor, pos=pos, y_dict=targets)
+            y["elastic_moduli"] = torch.tensor([k_mod, g_mod]); mask["elastic_moduli"][0] = True
+            y["phase_stability"] = torch.tensor([float(doc.energy_above_hull)]); mask["phase_stability"][0] = True
+
+            # FIX: only mark stability_window valid when the material actually
+            # HAS electrochemistry data. Materials without it are simply
+            # excluded from that head's loss -- not silently given a fake 0.0.
+            if m_id in electro_map:
+                v_low, v_high = electro_map[m_id]
+                y["stability_window"] = torch.tensor([v_low, v_high])
+                mask["stability_window"][0] = True
+            # ionic_conductivity stays masked False -- MP doesn't have real data for it.
+
+            data_obj = Data(x=x, edge_index=edge_index_tensor, pos=pos, y_dict=y, mask_dict=mask)
             data_obj.formula = doc.formula_pretty
-            data_obj.mp_id = m_id
-            
+            data_obj.source = "mp"
             pyg_dataset.append(data_obj)
-            
-    print(f"\n>>> Compiling Complete. Saved {len(pyg_dataset)} valid matrices to: {OUTPUT_PATH}")
-    torch.save(pyg_dataset, OUTPUT_PATH)
+
+    print(f">>> MP source: {len(pyg_dataset)} valid graphs.")
+    return pyg_dataset
+
+# ==============================================================================
+# SOURCE 2: OBELiX (real, experimentally measured ionic conductivity)
+# pip install obelix-data
+# ==============================================================================
+def build_obelix_dataset():
+    from obelix import OBELiX
+    ob = OBELiX()
+    pyg_dataset = []
+
+    print("\n=== OBELiX: Building ionic conductivity graphs from real CIF structures ===")
+    for entry in tqdm(ob.round_partial().with_cifs()):
+        ic = entry.get("Ionic conductivity (S cm-1)")
+        if ic is None or ic <= 0:
+            continue
+        structure = entry["structure"]
+        elements = [str(spec.symbol) for spec in structure.species]
+        graph = build_graph_from_structure(structure, elements)
+        if graph is None:
+            continue
+        x, pos, edge_index_tensor = graph
+
+        y, mask = make_empty_targets()
+        y["ionic_conductivity"] = torch.tensor([float(ic)])
+        mask["ionic_conductivity"][0] = True
+        # everything else stays masked False -- OBELiX doesn't have band_gap,
+        # dielectric, elastic_moduli, phase_stability, or stability_window.
+
+        data_obj = Data(x=x, edge_index=edge_index_tensor, pos=pos, y_dict=y, mask_dict=mask)
+        data_obj.formula = entry.get("Reduced Composition", "Unknown")
+        data_obj.source = "obelix"
+        pyg_dataset.append(data_obj)
+
+    print(f">>> OBELiX source: {len(pyg_dataset)} valid graphs.")
+    return pyg_dataset
+
+# ==============================================================================
+# MERGE + SAVE
+# ==============================================================================
+def build_equivariant_dataset():
+    os.makedirs('processed_data', exist_ok=True)
+    mp_data = build_mp_dataset()
+    try:
+        obelix_data = build_obelix_dataset()
+    except ImportError:
+        print("obelix-data not installed (`pip install obelix-data`) -- skipping real ionic conductivity data.")
+        obelix_data = []
+
+    full_dataset = mp_data + obelix_data
+    print(f"\n>>> Compiling Complete. Saved {len(full_dataset)} valid matrices "
+          f"({len(mp_data)} MP + {len(obelix_data)} OBELiX) to: {OUTPUT_PATH}")
+    torch.save(full_dataset, OUTPUT_PATH)
 
 if __name__ == "__main__":
     build_equivariant_dataset()

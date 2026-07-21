@@ -3,11 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_mean_pool, MessagePassing
-from sklearn.model_selection import train_test_split
 
-# ==============================================================================
-# ARCHITECTURE (must match train.py / predict.py)
-# ==============================================================================
 class RadialBasisExpansion(nn.Module):
     def __init__(self, num_rbf=16, r_max=6.0):
         super().__init__()
@@ -49,9 +45,9 @@ class EquivariantBatteryTransformer(nn.Module):
         self.fc_fused = nn.Sequential(nn.Linear(hidden, hidden * 2), nn.SiLU(), nn.Linear(hidden * 2, hidden), nn.SiLU())
         self.heads = nn.ModuleDict({
             "band_gap": nn.Linear(hidden, 1), "dielectric": nn.Linear(hidden, 1),
-            "ionic_conductivity": nn.Linear(hidden, 1), "activation_energy": nn.Linear(hidden, 1),
-            "stability_window": nn.Linear(hidden, 2), "phase_stability": nn.Linear(hidden, 1),
-            "elastic_moduli": nn.Linear(hidden, 2)
+            "ionic_conductivity": nn.Linear(hidden, 1),
+            "stability_window": nn.Linear(hidden, 2), "stability_gate": nn.Linear(hidden, 1),
+            "phase_stability": nn.Linear(hidden, 1), "elastic_moduli": nn.Linear(hidden, 2)
         })
     def forward(self, x, edge_index, pos, batch):
         h_x = F.silu(self.node_embed(x))
@@ -60,16 +56,25 @@ class EquivariantBatteryTransformer(nn.Module):
         latent = self.fc_fused(global_mean_pool(h_x, batch))
         return {k: head(latent) for k, head in self.heads.items()}
 
-LOG_SPACE_KEYS = ["dielectric", "elastic_moduli"]
+LOG_SPACE_KEYS = ["dielectric", "elastic_moduli", "ionic_conductivity"]
+REGRESSION_KEYS = ["band_gap", "dielectric", "ionic_conductivity",
+                   "stability_window", "phase_stability", "elastic_moduli"]
 
-# ==============================================================================
-# DIAGNOSTICS
-# ==============================================================================
+def stratified_split_by_source(full_dataset, test_size=0.15, random_state=42):
+    from sklearn.model_selection import train_test_split
+    mp_data = [d for d in full_dataset if d.source == "mp"]
+    obelix_data = [d for d in full_dataset if d.source == "obelix"]
+    mp_train, mp_val = train_test_split(mp_data, test_size=test_size, random_state=random_state)
+    if len(obelix_data) > 1:
+        ob_train, ob_val = train_test_split(obelix_data, test_size=test_size, random_state=random_state)
+    else:
+        ob_train, ob_val = obelix_data, []
+    return mp_train + ob_train, mp_val + ob_val
+
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     full_dataset = torch.load('processed_data/equivariant_battery_dataset.pt', weights_only=False)
-    train_data, val_data = train_test_split(full_dataset, test_size=0.15, random_state=42)
+    _, val_data = stratified_split_by_source(full_dataset)
 
     checkpoint = torch.load('models/equivariant_battery_transformer.pth', map_location=device)
     stats = checkpoint['norm_stats']
@@ -79,41 +84,61 @@ def main():
 
     val_loader = DataLoader(val_data, batch_size=32, shuffle=False)
 
-    keys = ["band_gap", "dielectric", "ionic_conductivity", "activation_energy",
-            "stability_window", "phase_stability", "elastic_moduli"]
-    abs_errors = {k: [] for k in keys}
-    all_targets = {k: [] for k in keys}
+    abs_errors = {k: [] for k in REGRESSION_KEYS}
+    log_abs_errors = {k: [] for k in REGRESSION_KEYS}  # orders-of-magnitude error, for wide-dynamic-range properties
+    n_valid = {k: 0 for k in REGRESSION_KEYS}
+    gate_correct, gate_total = 0, 0
 
     with torch.no_grad():
         for b in val_loader:
             b = b.to(device)
             preds = model(b.x, b.edge_index, b.pos, b.batch)
-            for key in keys:
+            for key in REGRESSION_KEYS:
                 t = b.y_dict[key].view(b.num_graphs, -1)
-                p_raw = preds[key]
-                if key in LOG_SPACE_KEYS:
-                    mu, sigma = stats[key]['mu'], stats[key]['sigma']
-                    p = torch.exp(p_raw * sigma + mu)
-                else:
-                    p = p_raw
-                abs_errors[key].append((p - t).abs().mean(dim=1))
-                all_targets[key].append(t)
+                mask = b.mask_dict[key].view(b.num_graphs, -1).bool().view(-1)
+                if not mask.any():
+                    continue
+                p_raw = preds[key][mask]
+                t_sub = t[mask]
 
-    print("\n" + "=" * 70)
-    print(f"{'Property':<22} | {'Val MAE':>10} | {'Target Mean':>12} | {'Target Std':>10} | {'% == 0':>7}")
-    print("=" * 70)
-    for key in keys:
-        errs = torch.cat(abs_errors[key])
-        targets = torch.cat(all_targets[key])
-        mae = errs.mean().item()
-        t_mean = targets.mean().item()
-        t_std = targets.std().item()
-        pct_zero = (targets.abs() < 1e-8).float().mean().item() * 100
-        print(f"{key.replace('_',' ').title():<22} | {mae:>10.4f} | {t_mean:>12.4f} | {t_std:>10.4f} | {pct_zero:>6.1f}%")
-    print("=" * 70)
-    print("\nIf '% == 0' is high for stability_window / phase_stability, those")
-    print("targets are likely degenerate/placeholder values, not real continuous")
-    print("labels -- worth checking your data prep for those two columns.")
+                if key == "stability_window":
+                    gate_pred = (torch.sigmoid(preds["stability_gate"][mask]) > 0.5).float().view(-1)
+                    is_nonzero = (t_sub.abs().sum(dim=1) > 1e-8).float()
+                    gate_correct += (gate_pred == is_nonzero).sum().item()
+                    gate_total += is_nonzero.numel()
+                    p_val = p_raw * (gate_pred.unsqueeze(-1))
+                elif key in LOG_SPACE_KEYS and key in stats:
+                    mu, sigma = stats[key]['mu'], stats[key]['sigma']
+                    p_val = torch.exp(p_raw * sigma + mu)
+                    # FIX: raw-space MAE is misleading for properties spanning
+                    # many orders of magnitude (ionic_conductivity especially --
+                    # a tiny absolute error can still mean many orders of
+                    # magnitude off). Report log-space error too.
+                    log_abs_errors[key].append((p_raw * sigma + mu - torch.log(t_sub + 1e-6)).abs().mean(dim=1))
+                else:
+                    p_val = p_raw
+
+                abs_errors[key].append((p_val - t_sub).abs().mean(dim=1))
+                n_valid[key] += mask.sum().item()
+
+    print("\n" + "=" * 75)
+    print(f"{'Property':<22} | {'Val MAE':>10} | {'Log-space MAE':>14} | {'# valid':>8}")
+    print("=" * 75)
+    for key in REGRESSION_KEYS:
+        if abs_errors[key]:
+            mae = torch.cat(abs_errors[key]).mean().item()
+            log_mae = torch.cat(log_abs_errors[key]).mean().item() if log_abs_errors[key] else float('nan')
+            log_str = f"{log_mae:>14.4f}" if log_abs_errors[key] else f"{'--':>14}"
+            print(f"{key.replace('_',' ').title():<22} | {mae:>10.4f} | {log_str} | {n_valid[key]:>8d}")
+        else:
+            print(f"{key.replace('_',' ').title():<22} | {'N/A':>10} | {'--':>14} | {0:>8d}")
+    if gate_total:
+        print(f"\nStability gate accuracy (nonzero-window classifier): {gate_correct/gate_total:.2%} ({gate_total} samples)")
+    print("=" * 75)
+    print("\nLog-space MAE for ionic_conductivity is in natural-log units --")
+    print("roughly 'average orders of magnitude off' (divide by ln(10)=2.303")
+    print("to convert to decades of magnitude). This matters much more than")
+    print("raw MAE for a property spanning ~10 orders of magnitude.")
 
 if __name__ == "__main__":
     main()
