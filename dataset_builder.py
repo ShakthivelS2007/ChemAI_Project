@@ -189,6 +189,54 @@ def build_mp_dataset():
             pyg_dataset.append(data_obj)
 
     print(f">>> MP source: {len(pyg_dataset)} valid graphs.")
+    mp_ids_used = {str(doc.material_id) for doc in docs}
+    return pyg_dataset, mp_ids_used
+
+# ==============================================================================
+# SOURCE 1b: Materials Project, band_gap ONLY, no dielectric/elasticity
+# co-requirement. band_gap doesn't need either of those to exist, and
+# requiring them cut the usable pool down to ~1900 materials for no reason
+# -- band_gap alone is available for a much larger fraction of MP. This is
+# the single biggest lever for band_gap's ~0.83 eV MAE: more real training
+# examples, not more architecture tuning.
+# ==============================================================================
+BANDGAP_ONLY_MAX_MATERIALS = 15000  # tune down if this makes a Colab run too slow
+
+def build_mp_bandgap_only_dataset(exclude_ids):
+    pyg_dataset = []
+    with MPRester(API_KEY) as mpr:
+        print("\n=== MP (band_gap only) STEP 1: Broad query, no dielectric/elasticity requirement ===")
+        docs = mpr.materials.summary.search(
+            energy_above_hull=(0, 0.5),
+            fields=["material_id", "structure", "band_gap", "formula_pretty"]
+        )[:BANDGAP_ONLY_MAX_MATERIALS]
+
+        print("=== MP (band_gap only) STEP 2: Mapping Features into Geometric Data Formats ===")
+        for doc in tqdm(docs):
+            m_id = str(doc.material_id)
+            if m_id in exclude_ids:
+                continue  # already covered (with more properties) by the main MP source
+            if doc.band_gap is None:
+                continue
+
+            struct = doc.structure
+            elements = [str(spec.symbol) for spec in struct.species]
+            graph = build_graph_from_structure(struct, elements)
+            if graph is None:
+                continue
+            x, pos, edge_index_tensor = graph
+
+            y, mask = make_empty_targets()
+            y["band_gap"] = torch.tensor([float(doc.band_gap)])
+            mask["band_gap"][0] = True
+            # everything else stays masked False -- this source only has band_gap.
+
+            data_obj = Data(x=x, edge_index=edge_index_tensor, pos=pos, y_dict=y, mask_dict=mask)
+            data_obj.formula = doc.formula_pretty
+            data_obj.source = "mp"  # same modality as the main MP source, grouped together for splitting
+            pyg_dataset.append(data_obj)
+
+    print(f">>> MP (band_gap only) source: {len(pyg_dataset)} additional valid graphs.")
     return pyg_dataset
 
 # ==============================================================================
@@ -231,16 +279,18 @@ def build_obelix_dataset():
 # ==============================================================================
 def build_equivariant_dataset():
     os.makedirs('processed_data', exist_ok=True)
-    mp_data = build_mp_dataset()
+    mp_data, mp_ids_used = build_mp_dataset()
+    mp_bandgap_data = build_mp_bandgap_only_dataset(exclude_ids=mp_ids_used)
     try:
         obelix_data = build_obelix_dataset()
     except ImportError:
         print("obelix-data not installed (`pip install obelix-data`) -- skipping real ionic conductivity data.")
         obelix_data = []
 
-    full_dataset = mp_data + obelix_data
+    full_dataset = mp_data + mp_bandgap_data + obelix_data
     print(f"\n>>> Compiling Complete. Saved {len(full_dataset)} valid matrices "
-          f"({len(mp_data)} MP + {len(obelix_data)} OBELiX) to: {OUTPUT_PATH}")
+          f"({len(mp_data)} MP full + {len(mp_bandgap_data)} MP band_gap-only + {len(obelix_data)} OBELiX) "
+          f"to: {OUTPUT_PATH}")
     torch.save(full_dataset, OUTPUT_PATH)
 
 if __name__ == "__main__":

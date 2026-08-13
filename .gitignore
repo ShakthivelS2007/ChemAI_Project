@@ -6,3 +6,5 @@ __pycache__/
 
 # Ignore raw data folders if you add them later
 processed_data/
+processed_data/equivariant_battery_dataset.pt
+processed_data/
